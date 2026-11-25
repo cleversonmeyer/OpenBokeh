@@ -1,0 +1,10 @@
+numpy
+opencv-python
+onnxruntime-directml
+pyvirtualcam
+pygrabber
+pillow
+onnx
+customtkinter
+pystray
+sounddevice

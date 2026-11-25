@@ -1,0 +1,15 @@
+LIBRARY OpenBokehGravador
+EXPORTS
+    GrListarMonitores
+    GrIniciar
+    GrAtualizar
+    GrQuadroWebcam
+    GrAudio
+    GrPausar
+    GrParar
+    GrEstado
+    GrSomIniciar
+    GrSomLer
+    GrSomParar
+    GrSomErro
+    GrSomQtd

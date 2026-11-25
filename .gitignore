@@ -1,0 +1,21 @@
+# ambiente e cache
+venv/
+__pycache__/
+*.pyc
+
+# gerados ao rodar/empacotar
+build/
+dist/
+config.json
+*.log
+modelos/*_io.onnx
+empacotar/versao_*.txt
+
+# DLLs compiladas (gerar com camera_virtual/compilar.sh e camera_mf/compilar.sh)
+camera_virtual/build/
+camera_mf/build/
+audio_rnnoise/build/
+gravador/build/
+
+# anotacoes internas de desenvolvimento
+PLANO-GRAVACAO.md
