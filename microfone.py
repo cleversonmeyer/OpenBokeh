@@ -102,7 +102,8 @@ def _wasapi(sd):
 # chamadas, medidor...). Por isso cada fluxo se registra aqui e a lista so e recarregada
 # quando nenhum estiver aberto.
 _abertos = set()
-_trava_pa = threading.Lock()
+_donos = set()              # MicrofoneLimpo ligados: pausam e voltam num recarregamento forcado
+_trava_pa = threading.RLock()   # toda troca na PortAudio passa por aqui
 
 
 def registrar(fluxo):
@@ -115,35 +116,266 @@ def liberar(fluxo):
         _abertos.discard(fluxo)
 
 
-def recarregar_lista(sd):
-    """Atualiza a lista de dispositivos se nao houver fluxo aberto. True se recarregou."""
+def recarregar_lista(sd, forcar=False):
+    """Atualiza a lista de dispositivos. Sem forcar, so se nenhum fluxo estiver aberto.
+    Forcando, o microfone das chamadas pausa um instante e volta (quem chama garante que
+    nao ha gravacao em andamento). True se recarregou."""
+    donos = []
     with _trava_pa:
-        if _abertos:
+        if _abertos and not forcar:
             return False
-        try:
-            sd._terminate()
-            sd._initialize()
-            return True
-        except Exception:
-            return False
+        donos = [d for d in _donos if d.ligado]
+    for d in donos:
+        d._parar()
+    with _trava_pa:
+        ok = False
+        if not _abertos:
+            try:
+                sd._terminate()
+                sd._initialize()
+                ok = True
+            except Exception:
+                ok = False
+    for d in donos:
+        d._reiniciar()
+    return ok
+
+
+# ---------------------------------------------------------------- microfone ligado/desligado
+def assinatura_dispositivos():
+    """Microfones ativos agora + qual e o padrao (API de audio do Windows): serve para
+    perceber quando um microfone e conectado, tirado ou trocado como padrao."""
+    try:
+        return tuple(sorted((n, p) for _i, n, p in microfones_windows()))
+    except Exception:
+        return ()
+
+
+def _assinatura_winmm():
+    """(reserva, sem uso) lista do winmm: em processo sem janela ela nao se atualiza."""
+    class CAPS(ctypes.Structure):
+        _fields_ = [("wMid", ctypes.c_ushort), ("wPid", ctypes.c_ushort), ("vDriverVersion", ctypes.c_uint),
+                    ("szPname", ctypes.c_wchar * 32), ("dwFormats", ctypes.c_uint), ("wChannels", ctypes.c_ushort),
+                    ("wReserved1", ctypes.c_ushort)]
+    try:
+        w = ctypes.windll.winmm
+        nomes = []
+        for i in range(w.waveInGetNumDevs()):
+            c = CAPS()
+            if w.waveInGetDevCapsW(i, ctypes.byref(c), ctypes.sizeof(c)) == 0:
+                nomes.append(c.szPname)
+        return tuple(sorted(nomes))
+    except Exception:
+        return ()
+
+
+class VigiaDispositivos:
+    """Confere a cada 2 s se a lista de microfones mudou e avisa (ao_mudar() roda nesta thread)."""
+
+    def __init__(self, ao_mudar):
+        self.ao_mudar = ao_mudar
+        self._ultima = assinatura_dispositivos()
+        self._rodar = True
+        threading.Thread(target=self._laco, daemon=True, name="vigia-microfones").start()
+
+    def _laco(self):
+        while self._rodar:
+            time.sleep(2)
+            atual = assinatura_dispositivos()
+            if atual != self._ultima:
+                self._ultima = atual
+                try:
+                    self.ao_mudar()
+                except Exception as e:
+                    print(f"[aviso] lista de microfones: {e}")
+
+    def parar(self):
+        self._rodar = False
+
+
+# ---------------------------------------------------------------- volume
+class AjusteVolume:
+    """Ganho do microfone (dB) + volume automatico (nivela a voz) + limitador (nao distorce).
+    Processa blocos float32 mono; o ganho muda suave dentro do bloco (sem estalos)."""
+    ALVO = 10 ** (-20 / 20)            # nivel medio de fala desejado (-20 dBFS)
+    VOZ = 10 ** (-48 / 20)             # abaixo disso e silencio/ruido: nao mexe no ganho automatico
+    AUTO_MIN, AUTO_MAX = 10 ** (-12 / 20), 10 ** (20 / 20)
+
+    def __init__(self, ganho_db=0.0, automatico=True):
+        self.ganho_db, self.automatico = ganho_db, automatico
+        self._auto = 1.0
+        self._g_ant = None
+
+    def processar(self, x):
+        if len(x) == 0:
+            return x
+        g = 10 ** (self.ganho_db / 20)
+        if self.automatico:
+            rms = float(np.sqrt(np.mean((x * g) ** 2)))
+            if rms > self.VOZ:
+                alvo = min(self.AUTO_MAX, max(self.AUTO_MIN, self.ALVO / rms))
+                # sobe devagar (~1 s), desce rapido (~60 ms): nao "bombeia" e nao estoura
+                k = 0.012 * len(x) / 480 if alvo > self._auto else 0.15 * len(x) / 480
+                self._auto += (alvo - self._auto) * min(1.0, k)
+            g *= self._auto
+        g_ant = g if self._g_ant is None else self._g_ant
+        y = x * np.linspace(g_ant, g, len(x), dtype=np.float32)
+        self._g_ant = g
+        return limitar(y)
+
+
+def limitar(y, joelho=0.7):
+    """Limitador suave: abaixo do joelho passa igual; acima, curva ate no maximo 1.0."""
+    a = np.abs(y)
+    acima = a > joelho
+    if acima.any():
+        y = y.copy()
+        y[acima] = np.sign(y[acima]) * (joelho + (1 - joelho) * np.tanh((a[acima] - joelho) / (1 - joelho)))
+    return y.astype(np.float32)
+
+
+class Aquecimento:
+    """O RNNoise leva alguns decimos de segundo para aprender o ruido do ambiente; nesse
+    comeco a voz pode sair "tremida". Segura o inicio em silencio e entra suave."""
+
+    def __init__(self, silencio=0.30, rampa=0.15):
+        self.silencio, self.rampa = int(silencio * TAXA), int(rampa * TAXA)
+        self.pos = 0
+
+    def processar(self, x):
+        if self.pos >= self.silencio + self.rampa:
+            return x
+        t = np.arange(self.pos, self.pos + len(x))
+        self.pos += len(x)
+        f = np.clip((t - self.silencio) / self.rampa, 0, 1).astype(np.float32)
+        return x * f
+
+
+def ganho_de(cfg, nome):
+    """Ganho salvo para o microfone (por nome; "" = padrao do Windows)."""
+    g = (cfg.get("ganhos_microfone") or {}).get(nome or "", 0)
+    return float(g) if isinstance(g, (int, float)) else 0.0
+
+
+# ---------------------------------------------------------------- microfones pela API do Windows
+# A lista e a captura dos microfones vem direto da WASAPI (na DLL do gravador): a lista e
+# sempre a atual e um microfone plugado/tirado aparece na hora, sem "religar" nada.
+# (Antes a PortAudio precisava ser reiniciada para ver microfone novo, o que podia esvaziar
+# a lista ou travar o app dentro do MMDevAPI.dll do Windows.)
+_trava_dll_mic = threading.RLock()
+
+
+def _dll_mic():
+    import gravador
+    d = gravador.dll()
+    if not getattr(d, "_mic_ok", False):
+        d.GrMicListar.argtypes = [ctypes.c_wchar_p, ctypes.c_int]
+        d.GrMicAbrir.argtypes = [ctypes.c_wchar_p]
+        d.GrMicLer.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        d.GrMicEstado.argtypes = [ctypes.c_int]
+        d.GrMicFechar.argtypes = [ctypes.c_int]
+        d._mic_ok = True
+    return d
+
+
+def microfones_windows():
+    """[(id, nome, padrao)] dos microfones ativos agora."""
+    try:
+        buf = ctypes.create_unicode_buffer(16384)
+        with _trava_dll_mic:
+            _dll_mic().GrMicListar(buf, 16384)
+    except Exception as e:
+        print(f"[aviso] lista de microfones: {e}")
+        return []
+    lista = []
+    for linha in buf.value.splitlines():
+        if "|" not in linha:
+            continue
+        ident, nome = linha.split("|", 1)
+        lista.append((ident.lstrip("*"), nome, ident.startswith("*")))
+    return lista
+
+
+def _id_mic(nome):
+    """id do microfone pelo nome; "" (padrao do Windows) se o nome nao existir mais."""
+    if not nome:
+        return ""
+    return next((i for i, n, _p in microfones_windows() if n == nome), "")
 
 
 def dispositivos(atualizar=True):
-    """(microfones, nome do cabo ou None). Usa o WASAPI (menor atraso)."""
-    import sounddevice as sd
-    if atualizar:
-        recarregar_lista(sd)      # microfone/cabo ligado com o app aberto
-    api, _h = _wasapi(sd)
-    mics, cabo = [], None
-    for d in sd.query_devices():
-        if d["hostapi"] != api:
-            continue
-        if d["max_input_channels"] > 0 and MIC_DO_CABO.lower() not in d["name"].lower() \
-                and "vb-audio" not in d["name"].lower():
-            mics.append(d["name"])
-        if d["max_output_channels"] > 0 and NOME_CABO.lower() in d["name"].lower():
-            cabo = d["name"]
+    """(microfones, nome do cabo ou None). Os microfones vem da API do Windows (sempre atual);
+    o cabo virtual (saida), da PortAudio."""
+    mics = [n for _i, n, _p in microfones_windows()
+            if MIC_DO_CABO.lower() not in n.lower() and "vb-audio" not in n.lower()]
+    cabo = None
+    try:
+        import sounddevice as sd
+        api, _h = _wasapi(sd)
+        for d in sd.query_devices():
+            if d["hostapi"] == api and d["max_output_channels"] > 0 and NOME_CABO.lower() in d["name"].lower():
+                cabo = d["name"]
+    except Exception:
+        pass
     return mics, cabo
+
+
+class CapturaMic:
+    """Captura de um microfone pela WASAPI (DLL). Imita o fluxo da sounddevice:
+    start/stop/close/active, e chama callback(dados[n,1], n, None, None) em blocos."""
+
+    def __init__(self, nome, callback, bloco=QUADRO):
+        self.nome, self.callback, self.bloco = nome, callback, bloco
+        self.h = -1
+        self._rodar = False
+        self._t = None
+
+    def start(self):
+        d = _dll_mic()
+        ident = _id_mic(self.nome)          # (fora da trava: consulta a lista)
+        with _trava_dll_mic:
+            self.h = d.GrMicAbrir(ident)
+        if self.h < 0 or d.GrMicEstado(self.h) != 0:
+            self.close()
+            raise RuntimeError(_("o microfone não abriu (desconectado ou em uso exclusivo)"))
+        self._rodar = True
+        self._t = threading.Thread(target=self._laco, daemon=True, name="captura-microfone")
+        self._t.start()
+
+    def _laco(self):
+        d = _dll_mic()
+        buf = np.zeros(9600, np.float32)
+        resto = np.zeros(0, np.float32)
+        while self._rodar:
+            time.sleep(0.005)
+            n = d.GrMicLer(self.h, buf.ctypes.data, len(buf))
+            if not n:
+                continue
+            x = np.concatenate((resto, buf[:n]))
+            k = len(x) // self.bloco * self.bloco
+            for i in range(0, k, self.bloco):
+                try:
+                    self.callback(x[i:i + self.bloco].reshape(-1, 1), self.bloco, None, None)
+                except Exception as e:
+                    print(f"[aviso] captura do microfone: {e}")
+            resto = x[k:].copy()
+
+    @property
+    def active(self):
+        return self._rodar and self.h >= 0 and _dll_mic().GrMicEstado(self.h) == 0
+
+    def stop(self):
+        self._rodar = False
+        if self._t is not None:
+            self._t.join(timeout=1)
+            self._t = None
+
+    def close(self):
+        self.stop()
+        if self.h >= 0:
+            with _trava_dll_mic:
+                _dll_mic().GrMicFechar(self.h)
+            self.h = -1
 
 
 def cabo_instalado():
@@ -155,13 +387,7 @@ def cabo_instalado():
 
 def microfone_padrao():
     """Nome do microfone padrao do Windows (ou "")."""
-    try:
-        import sounddevice as sd
-        api, h = _wasapi(sd)
-        i = h["default_input_device"] if h else -1
-        return sd.query_devices(i)["name"] if i is not None and i >= 0 else ""
-    except Exception:
-        return ""
+    return next((n for _i, n, p in microfones_windows() if p), "")
 
 
 def _indice(sd, nome, entrada):
@@ -186,6 +412,8 @@ def criar(cfg):
 
 def aplicar(m, cfg):
     if m is not None:
+        m.volume.ganho_db = ganho_de(cfg, cfg["microfone_entrada"])
+        m.volume.automatico = bool(cfg.get("volume_automatico", True))
         m.configurar(cfg["microfone_limpo"], cfg["microfone_entrada"], cfg["microfone_intensidade"])
 
 
@@ -205,6 +433,8 @@ class MicrofoneLimpo:
         self._trava = threading.Lock()
         self._vigia = None
         self._resto = np.zeros(0, np.float32)
+        self.volume = AjusteVolume()
+        self._aquecer = Aquecimento()
 
     # -------- controle
     def configurar(self, ligado, mic="", intensidade=100):
@@ -213,12 +443,16 @@ class MicrofoneLimpo:
         self.mic = mic
         if ligado and (not self.ligado or mudou_mic):
             self.ligado = True
+            with _trava_pa:
+                _donos.add(self)
             self._reiniciar()
             if self._vigia is None:
                 self._vigia = threading.Thread(target=self._vigiar, daemon=True, name="microfone")
                 self._vigia.start()
         elif not ligado and self.ligado:
             self.ligado = False
+            with _trava_pa:
+                _donos.discard(self)
             self._parar()
             self.erro = ""
 
@@ -249,26 +483,24 @@ class MicrofoneLimpo:
             return
         try:
             import sounddevice as sd
-            _mics, cabo = dispositivos()          # (so recarrega se nada estiver aberto)
+            _mics, cabo = dispositivos(atualizar=False)   # nao religa a PortAudio por conta propria
             if cabo is None:
                 self.erro = _("Cabo de áudio virtual não encontrado. Instale o VB-CABLE (gratuito) e reinicie o computador.")
                 return
-            i_mic = _indice(sd, self.mic, True)
             i_cabo = _indice(sd, cabo, False)
-            if i_mic is None or i_mic < 0:
+            if not microfones_windows():
                 self.erro = _("Nenhum microfone encontrado.")
                 return
             self._rn = RNNoise()
+            self._aquecer = Aquecimento()
             self._fila.clear()
             self._resto = np.zeros(0, np.float32)
             extra = sd.WasapiSettings(auto_convert=True)
-            ent = sd.InputStream(device=i_mic, samplerate=TAXA, channels=1, dtype="float32", blocksize=QUADRO,
-                                 latency="low", extra_settings=extra, callback=self._ao_capturar)
+            ent = CapturaMic(self.mic, self._ao_capturar)
             sai = sd.OutputStream(device=i_cabo, samplerate=TAXA, channels=1, dtype="float32", blocksize=QUADRO,
                                   latency="low", extra_settings=extra, callback=self._ao_tocar)
             ent.start()
             sai.start()
-            registrar(ent)
             registrar(sai)
             with self._trava:
                 self._fluxos = (ent, sai)
@@ -285,7 +517,7 @@ class MicrofoneLimpo:
         while len(x) - i >= QUADRO:
             q = x[i:i + QUADRO]
             limpo, _voz = self._rn.processar(q, self.intensidade)
-            self._fila.append(limpo)
+            self._fila.append(self.volume.processar(self._aquecer.processar(limpo)))
             i += QUADRO
         self._resto = x[i:].copy()
         while len(self._fila) > MAX_FILA:
@@ -327,29 +559,35 @@ class Medidor:
 
     def __init__(self):
         self.nivel = 0.0
+        self.estourou = 0.0      # momento (time.time) da ultima vez que passou do limite
         self.nome = None
         self.erro = ""
         self._f = None
+        self.volume = AjusteVolume()
 
     def iniciar(self, nome=""):
         if self._f is not None and nome == self.nome:
             return
+        with _trava_pa:
+            self._iniciar(nome)
+
+    def _iniciar(self, nome):
         self.parar()
         self.nome = nome
         try:
-            import sounddevice as sd
-            idx = _indice(sd, nome, True)
-            f = sd.InputStream(device=idx, samplerate=TAXA, channels=1, dtype="float32", blocksize=960,
-                               extra_settings=sd.WasapiSettings(auto_convert=True), callback=self._cb)
+            f = CapturaMic(nome, self._cb, bloco=960)
             f.start()
-            registrar(f)
             self._f, self.erro = f, ""
         except Exception as e:
             self.erro = str(e)[:100]
             self._f = None
 
     def _cb(self, dados, n, _t, _s):
-        pico = float(np.abs(dados).max()) if n else 0.0
+        bruto = dados[:, 0]
+        if n and float(np.abs(bruto).max()) > 0.98:       # o proprio microfone ja chega estourado
+            self.estourou = time.time()
+        y = self.volume.processar(bruto.copy())
+        pico = float(np.abs(y).max()) if n else 0.0
         self.nivel = max(pico, self.nivel * 0.8)
 
     def parar(self):
@@ -371,11 +609,14 @@ def testar(mic="", segundos=4, ao_terminar=None, ao_mudar=None):
     def rodar():
         try:
             import sounddevice as sd
-            i_mic = _indice(sd, mic, True)
             extra = sd.WasapiSettings(auto_convert=True)
             ao_mudar and ao_mudar("gravando")
-            bruto = sd.rec(int(segundos * TAXA), samplerate=TAXA, channels=1, dtype="float32", device=i_mic,
-                           extra_settings=extra, blocking=True)[:, 0]
+            partes = []
+            cap = CapturaMic(mic, lambda dados, n, _t, _s: partes.append(dados[:, 0].copy()))
+            cap.start()
+            time.sleep(segundos)
+            cap.close()
+            bruto = np.concatenate(partes) if partes else np.zeros(QUADRO, np.float32)
             rn = RNNoise()
             n = len(bruto) // QUADRO * QUADRO
             limpo = np.concatenate([rn.processar(bruto[i:i + QUADRO])[0] for i in range(0, n, QUADRO)])

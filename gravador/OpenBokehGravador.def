@@ -13,3 +13,8 @@ EXPORTS
     GrSomParar
     GrSomErro
     GrSomQtd
+    GrMicListar
+    GrMicAbrir
+    GrMicLer
+    GrMicEstado
+    GrMicFechar

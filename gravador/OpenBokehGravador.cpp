@@ -36,6 +36,8 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <ksmedia.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propvarutil.h>
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -1079,3 +1081,168 @@ extern "C" __declspec(dllexport) void GrSomParar() {
 }
 
 extern "C" __declspec(dllexport) const wchar_t* GrSomErro() { return g_somErro; }
+
+
+// ------------------------------------------------------------------ microfones (WASAPI)
+// Lista e captura microfones direto pela API de audio do Windows. A lista e sempre a atual
+// (microfone plugado/tirado aparece na hora) e nada precisa ser "religado" -- antes, a
+// PortAudio tinha de ser reiniciada para ver um microfone novo, o que travava no MMDevAPI.
+static const int MIC_MAX = 8, MIC_CAP = 48000 * 2;      // ate 8 capturas, 2 s de folga cada
+struct Mic {
+    volatile LONG rodar;
+    volatile LONG estado;       // 0 = capturando, 1 = parou (desconectado/erro), 2 = iniciando
+    HANDLE thread;
+    wchar_t id[512];
+    float anel[MIC_CAP];
+    int ini, qtd;
+    CRITICAL_SECTION cs;
+};
+static Mic* g_mic[MIC_MAX] = {};
+
+static void micGuardar(Mic* m, const float* x, int n) {
+    EnterCriticalSection(&m->cs);
+    for (int i = 0; i < n; i++) {
+        if (m->qtd == MIC_CAP) { m->ini = (m->ini + 1) % MIC_CAP; m->qtd--; }
+        m->anel[(m->ini + m->qtd) % MIC_CAP] = x ? x[i] : 0.f;
+        m->qtd++;
+    }
+    LeaveCriticalSection(&m->cs);
+}
+
+static DWORD WINAPI micRodar(void* arg) {
+    Mic* m = (Mic*)arg;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    Com<IMMDeviceEnumerator> en; Com<IMMDevice> disp; Com<IAudioClient> cli; Com<IAudioCaptureClient> cap;
+    HRESULT hr = CoCreateInstance(OB_CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, OB_IID_IMMDeviceEnumerator, (void**)&en);
+    if (SUCCEEDED(hr)) hr = m->id[0] ? en->GetDevice(m->id, &disp) : en->GetDefaultAudioEndpoint(eCapture, eConsole, &disp);
+    if (SUCCEEDED(hr)) hr = disp->Activate(OB_IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&cli);
+    int canais = 1;
+    if (SUCCEEDED(hr)) {
+        // 48 kHz float; o Windows converte da taxa/canais do microfone (AUTOCONVERTPCM)
+        for (int tentativa = 0; tentativa < 2; tentativa++) {
+            canais = tentativa == 0 ? 1 : 2;
+            WAVEFORMATEXTENSIBLE wf = {};
+            wf.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE; wf.Format.nChannels = (WORD)canais;
+            wf.Format.nSamplesPerSec = 48000; wf.Format.wBitsPerSample = 32;
+            wf.Format.nBlockAlign = (WORD)(4 * canais); wf.Format.nAvgBytesPerSec = 48000 * 4 * canais;
+            wf.Format.cbSize = 22; wf.Samples.wValidBitsPerSample = 32;
+            wf.dwChannelMask = canais == 1 ? SPEAKER_FRONT_CENTER : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+            wf.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+            hr = cli->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                 2000000, 0, (WAVEFORMATEX*)&wf, nullptr);
+            if (SUCCEEDED(hr)) break;
+            if (tentativa == 0) { cli.reset(); hr = disp->Activate(OB_IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&cli); if (FAILED(hr)) break; }
+        }
+    }
+    if (SUCCEEDED(hr)) hr = cli->GetService(OB_IID_IAudioCaptureClient, (void**)&cap);
+    if (SUCCEEDED(hr)) hr = cli->Start();
+    if (FAILED(hr)) { m->estado = 1; CoUninitialize(); return 1; }
+    m->estado = 0;
+    float mono[4800];
+    while (m->rodar) {
+        Sleep(5);
+        UINT32 n = 0;
+        HRESULT h2;
+        while (SUCCEEDED(h2 = cap->GetNextPacketSize(&n)) && n > 0) {
+            BYTE* dados; UINT32 q; DWORD fl;
+            if (FAILED(h2 = cap->GetBuffer(&dados, &q, &fl, nullptr, nullptr))) break;
+            const float* f = (const float*)dados;
+            for (UINT32 p = 0; p < q; p += 4800) {
+                UINT32 k = q - p < 4800 ? q - p : 4800;
+                if (fl & AUDCLNT_BUFFERFLAGS_SILENT) micGuardar(m, nullptr, (int)k);
+                else if (canais == 1) micGuardar(m, f + p, (int)k);
+                else {
+                    for (UINT32 i = 0; i < k; i++) mono[i] = 0.5f * (f[(p + i) * 2] + f[(p + i) * 2 + 1]);
+                    micGuardar(m, mono, (int)k);
+                }
+            }
+            cap->ReleaseBuffer(q);
+        }
+        if (FAILED(h2)) { m->estado = 1; break; }        // microfone tirado / desativado
+    }
+    cli->Stop();
+    CoUninitialize();
+    return 0;
+}
+
+// "id|nome\n" de cada microfone ativo; o padrao do Windows vem primeiro com "*" antes do id
+extern "C" __declspec(dllexport) int GrMicListar(wchar_t* buf, int tamanho) {
+    if (!buf || tamanho <= 0) return 0;
+    buf[0] = 0;
+    HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int n = 0;
+    {
+        Com<IMMDeviceEnumerator> en; Com<IMMDeviceCollection> col;
+        if (SUCCEEDED(CoCreateInstance(OB_CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, OB_IID_IMMDeviceEnumerator, (void**)&en)) &&
+            SUCCEEDED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &col))) {
+            wchar_t padrao[512] = L"";
+            Com<IMMDevice> dp;
+            if (SUCCEEDED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &dp))) {
+                LPWSTR idp = nullptr;
+                if (SUCCEEDED(dp->GetId(&idp))) { wcsncpy(padrao, idp, 511); CoTaskMemFree(idp); }
+            }
+            UINT total = 0; col->GetCount(&total);
+            for (UINT i = 0; i < total; i++) {
+                Com<IMMDevice> d; LPWSTR id = nullptr;
+                if (FAILED(col->Item(i, &d)) || FAILED(d->GetId(&id))) continue;
+                wchar_t nome[256] = L"?";
+                Com<IPropertyStore> ps;
+                if (SUCCEEDED(d->OpenPropertyStore(STGM_READ, &ps))) {
+                    PROPVARIANT pv; PropVariantInit(&pv);
+                    if (SUCCEEDED(ps->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR) wcsncpy(nome, pv.pwszVal, 255);
+                    PropVariantClear(&pv);
+                }
+                wchar_t linha[800];
+                _snwprintf(linha, 799, L"%ls%ls|%ls\n", wcscmp(id, padrao) == 0 ? L"*" : L"", id, nome);
+                linha[799] = 0;
+                CoTaskMemFree(id);
+                if ((int)(wcslen(buf) + wcslen(linha)) < tamanho - 1) { wcscat(buf, linha); n++; }
+            }
+        }
+    }
+    if (SUCCEEDED(ci)) CoUninitialize();
+    return n;
+}
+
+// abre a captura (id vazio = microfone padrao do Windows); devolve um numero (0..7) ou -1
+extern "C" __declspec(dllexport) int GrMicAbrir(const wchar_t* id) {
+    for (int h = 0; h < MIC_MAX; h++) {
+        if (g_mic[h]) continue;
+        Mic* m = (Mic*)calloc(1, sizeof(Mic));
+        if (!m) return -1;
+        InitializeCriticalSection(&m->cs);
+        if (id) wcsncpy(m->id, id, 511);
+        m->rodar = 1; m->estado = 2;
+        m->thread = CreateThread(nullptr, 0, micRodar, m, 0, nullptr);
+        for (int i = 0; i < 300 && m->estado == 2; i++) Sleep(5);   // espera abrir (ate 1,5 s)
+        g_mic[h] = m;
+        return h;
+    }
+    return -1;
+}
+
+extern "C" __declspec(dllexport) int GrMicLer(int h, float* buf, int max) {
+    if (h < 0 || h >= MIC_MAX || !g_mic[h] || !buf || max <= 0) return 0;
+    Mic* m = g_mic[h];
+    EnterCriticalSection(&m->cs);
+    int n = m->qtd < max ? m->qtd : max;
+    for (int i = 0; i < n; i++) buf[i] = m->anel[(m->ini + i) % MIC_CAP];
+    m->ini = (m->ini + n) % MIC_CAP; m->qtd -= n;
+    LeaveCriticalSection(&m->cs);
+    return n;
+}
+
+extern "C" __declspec(dllexport) int GrMicEstado(int h) {
+    return (h < 0 || h >= MIC_MAX || !g_mic[h]) ? 1 : (int)g_mic[h]->estado;
+}
+
+extern "C" __declspec(dllexport) void GrMicFechar(int h) {
+    if (h < 0 || h >= MIC_MAX || !g_mic[h]) return;
+    Mic* m = g_mic[h];
+    g_mic[h] = nullptr;
+    m->rodar = 0;
+    WaitForSingleObject(m->thread, 3000);
+    CloseHandle(m->thread);
+    DeleteCriticalSection(&m->cs);
+    free(m);
+}

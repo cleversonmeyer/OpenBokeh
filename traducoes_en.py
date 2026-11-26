@@ -579,4 +579,9 @@ EN = {
     'Leitura e envio de áudio': 'Reading and sending audio',
     'PortAudio e Matthias Geier': 'PortAudio and Matthias Geier',
     'Câmera com IA e gravação de tela': 'AI camera and screen recording',
+    'Volume': 'Volume',
+    'Volume automático (nivela a voz)': 'Automatic volume (levels your voice)',
+    'O microfone está chegando estourado: baixe o volume dele no Windows (Configurações › Som)': 'The microphone is clipping before it reaches the app: lower its level in Windows (Settings › Sound)',
+    'Lista de microfones atualizada': 'Microphone list updated',
+    'o microfone não abriu (desconectado ou em uso exclusivo)': 'the microphone did not open (disconnected or in exclusive use)',
 }

@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 import captura as CAP
+import microfone as MIC
 import gravador as G
 from i18n import _
 
@@ -39,6 +40,8 @@ PADRAO = {
     "grav_cam_borda": 4,             # px em 1080p
     "grav_mic": True,
     "grav_mic_entrada": "",          # microfone da gravacao ("" = padrao do Windows)
+    "ganhos_microfone": {},          # nome do microfone -> volume em dB (-12..+24); vale p/ gravacao e chamadas
+    "volume_automatico": True,       # nivela a voz (sobe microfone baixo, segura o alto) + limitador
     "grav_mic_sem_ruido": True,
     "grav_som_pc": True,
     "grav_pasta": "",
@@ -572,7 +575,9 @@ class Controle:
             self.audio = G.MisturadorAudio(
                 g, mic=self.cfg["grav_mic"], mic_nome=self.cfg.get("grav_mic_entrada", ""),
                 sem_ruido=self.cfg["grav_mic_sem_ruido"], intensidade=self.cfg.get("microfone_intensidade", 100) / 100,
-                som_pc=self.cfg["grav_som_pc"])
+                som_pc=self.cfg["grav_som_pc"],
+                ganho_db=MIC.ganho_de(self.cfg, self.cfg.get("grav_mic_entrada", "")),
+                volume_automatico=bool(self.cfg.get("volume_automatico", True)))
             self.audio.iniciar()
             if self.audio.erro:
                 print(f"[aviso] audio da gravacao: {self.audio.erro}")

@@ -1,5 +1,17 @@
 # Histórico de versões / Changelog
 
+## 1.0.1 — 25/11/2026
+- **Microfones lidos direto da API de áudio do Windows (WASAPI)**: a lista é sempre a atual. Um microfone
+  plugado ou tirado aparece ou some sozinho (o app confere a cada 2 s), sem precisar reabrir.
+- Correção: o botão ↻ da lista de microfones podia travar e fechar o app (falha no MMDevAPI.dll do Windows), e
+  tirar um microfone podia esvaziar a lista. A causa era religar a biblioteca de áudio (PortAudio) para
+  enxergar microfones novos, o que não é mais necessário.
+- **Volume por microfone** (-12 a +24 dB, guardado para cada microfone) e **volume automático**, que nivela
+  a voz: sobe microfone baixo (ex.: lapela) e segura microfone alto. Com **limitador**, para não distorcer.
+- O medidor mostra o nível já com o volume e fica vermelho se o microfone chegar estourado.
+- **Sem "tremida" no começo**: o redutor de ruído (RNNoise) aprende o ambiente nos primeiros 0,3 s com o som
+  em silêncio e entra suave.
+
 ## 1.0.0 — 25/11/2026
 **Primeira versão pública. / First public release.**
 

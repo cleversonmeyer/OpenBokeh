@@ -180,14 +180,32 @@ class PaginaGravacao:
                       hover_color=c["BORDA"], text_color=c["TEXTO"], border_width=1, border_color=c["BORDA"],
                       command=self._listar_mics).pack(side="left", padx=(6, 0))
         medidor("nivel_mic")
-        self.lbl_mic = ctk.CTkLabel(p, text="", font=f_peq, text_color="#FFC857", anchor="w", justify="left")
+        self.lbl_mic = ctk.CTkLabel(p, text="", font=f_peq, text_color="#FFC857", anchor="w", justify="left",
+                                    height=14, wraplength=280)
         self.lbl_mic.pack(fill="x", padx=12)
+        # volume do microfone escolhido (guardado por microfone) + automatico
+        lv = ctk.CTkFrame(p, fg_color="transparent")
+        lv.pack(fill="x", padx=12, pady=(2, 0))
+        ctk.CTkLabel(lv, text=_("Volume"), font=f_peq, text_color=c["TEXTO"], width=52, anchor="w").pack(side="left")
+        self.var_ganho = ctk.DoubleVar(value=0)
+        ctk.CTkSlider(lv, from_=-12, to=24, number_of_steps=36, variable=self.var_ganho, height=16,
+                      button_length=0, button_corner_radius=8, button_color="#FFFFFF", button_hover_color="#E6E0FF",
+                      progress_color=c["ACENTO"], fg_color=c["BORDA"], command=self._mudar_ganho
+                      ).pack(side="left", fill="x", expand=True)
+        self.lbl_ganho = ctk.CTkLabel(lv, text="0 dB", font=f_peq, text_color=c["TEXTO"], width=48, anchor="e")
+        self.lbl_ganho.pack(side="left")
+        self.var_auto = ctk.BooleanVar(value=cfg.get("volume_automatico", True))
+        ctk.CTkSwitch(p, text=_("Volume automático (nivela a voz)"), variable=self.var_auto, font=f_normal,
+                      text_color=c["TEXTO"], progress_color=c["ACENTO"], button_color="#FFFFFF",
+                      button_hover_color="#E6E0FF", fg_color=c["BORDA"], switch_width=40, switch_height=20,
+                      command=self._mudar_auto).pack(anchor="w", padx=12, pady=3)
         chave("grav_mic_sem_ruido", _("Tirar o ruído do microfone"))
         chave("grav_som_pc", _("Som do computador"))
         medidor("nivel_pc")
         import microfone as MIC
         self.medidor_mic = MIC.Medidor()
         self._listar_mics()
+        self._sincronizar_volume()
 
         secao(_("Qualidade"), 14)
         segmentos("grav_preset", [("edicao", _("Edição")), ("alta", _("Alta")), ("compacta", _("Compacta"))])
@@ -270,17 +288,61 @@ class PaginaGravacao:
         atual = self.cfg.get("grav_mic_entrada", "")
         valores = [self._rot_padrao] + mics
         if atual and atual not in mics:
-            self.lbl_mic.configure(text=_("“{nome}” não está conectado — vai usar o padrão do Windows").format(nome=atual))
+            self._aviso_mic = _("“{nome}” não está conectado — vai usar o padrão do Windows").format(nome=atual)
         else:
-            self.lbl_mic.configure(text="")
+            self._aviso_mic = ""
+        self._conf(self.lbl_mic, text=self._aviso_mic)
         self.menu_mic.configure(values=valores)
         self.var_mic.set(atual if atual in mics else self._rot_padrao)
 
     def _escolher_mic(self, rotulo):
         nome = "" if rotulo == self._rot_padrao else rotulo
-        self.lbl_mic.configure(text="")
+        self._aviso_mic = ""
+        self._conf(self.lbl_mic, text="")
         self._mudar("grav_mic_entrada", nome)
         self.medidor_mic.parar()               # o laco reabre no microfone novo
+        self._sincronizar_volume()
+
+    # -------- volume do microfone
+    def _sincronizar_volume(self):
+        import microfone as MIC
+        g = MIC.ganho_de(self.cfg, self.cfg.get("grav_mic_entrada", ""))
+        self.var_ganho.set(g)
+        self.lbl_ganho.configure(text=f"{g:+.0f} dB" if g else "0 dB")
+        self._aplicar_volume()
+
+    def _mudar_ganho(self, v):
+        v = round(float(v))
+        nome = self.cfg.get("grav_mic_entrada", "")
+        ganhos = dict(self.cfg.get("ganhos_microfone") or {})
+        ganhos[nome] = v
+        self.cfg["ganhos_microfone"] = ganhos
+        self.lbl_ganho.configure(text=f"{v:+d} dB" if v else "0 dB")
+        self.mudou()
+        self._aplicar_volume()
+
+    def _mudar_auto(self):
+        self.cfg["volume_automatico"] = bool(self.var_auto.get())
+        self.mudou()
+        self._aplicar_volume()
+
+    def _aplicar_volume(self):
+        """Vale na hora: medidor, gravacao em andamento e o microfone das chamadas."""
+        import microfone as MIC
+        g = MIC.ganho_de(self.cfg, self.cfg.get("grav_mic_entrada", ""))
+        auto = bool(self.cfg.get("volume_automatico", True))
+        self.medidor_mic.volume.ganho_db, self.medidor_mic.volume.automatico = g, auto
+        a = self.grav.audio
+        if a is not None and getattr(a, "_volume", None) is not None:
+            a._volume.ganho_db, a._volume.automatico = g, auto
+        if getattr(self.motor, "microfone", None) is not None:
+            self.motor.microfone.volume.ganho_db = MIC.ganho_de(self.cfg, self.cfg.get("microfone_entrada", ""))
+            self.motor.microfone.volume.automatico = auto
+
+    def microfones_mudaram(self):
+        """Um microfone foi conectado/desconectado (aviso do Windows)."""
+        self._listar_mics()
+        self._sincronizar_volume()
 
     def _escolher_janela(self, nome):
         j = getattr(self, "_janelas", {}).get(nome)
@@ -416,7 +478,13 @@ class PaginaGravacao:
                 elif self.cfg["grav_mic"]:
                     # antes de gravar: medidor ao vivo do microfone escolhido (nada e gravado)
                     self.medidor_mic.iniciar(self.cfg.get("grav_mic_entrada", ""))
-                    self.medidores["nivel_mic"].set(min(1.0, max(self.medidor_mic.nivel, 1e-4) ** 0.5))
+                    b = self.medidores["nivel_mic"]
+                    b.set(min(1.0, max(self.medidor_mic.nivel, 1e-4) ** 0.5))
+                    estoura = time.time() - self.medidor_mic.estourou < 1.5
+                    self._conf(b, progress_color="#FF5A5A" if estoura else "#3DDC97")
+                    self._conf(self.lbl_mic, text=_("O microfone está chegando estourado: baixe o volume dele no "
+                                                    "Windows (Configurações › Som)") if estoura else
+                               getattr(self, "_aviso_mic", ""))
                 else:
                     self.medidor_mic.parar()
                     self.medidores["nivel_mic"].set(0)

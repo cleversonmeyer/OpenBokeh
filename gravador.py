@@ -296,7 +296,7 @@ class MisturadorAudio:
     com silencio o que faltar (nada tocando, microfone desligado...)."""
 
     def __init__(self, gravacao, mic=True, mic_nome="", sem_ruido=True, intensidade=1.0, vol_mic=1.0,
-                 som_pc=True, vol_pc=0.8):
+                 som_pc=True, vol_pc=0.8, ganho_db=0.0, volume_automatico=True):
         self.g = gravacao
         self.mic, self.mic_nome, self.sem_ruido, self.intensidade = mic, mic_nome, sem_ruido, intensidade
         self.vol_mic, self.som_pc, self.vol_pc = vol_mic, som_pc, vol_pc
@@ -307,6 +307,9 @@ class MisturadorAudio:
         self._fluxo = None
         self._rodar = False
         self._rn = None
+        self.ganho_db, self.volume_automatico = ganho_db, volume_automatico
+        self._volume = None
+        self._aquecer = None
 
     def iniciar(self):
         self._rodar = True
@@ -315,16 +318,14 @@ class MisturadorAudio:
             self.som_pc = False
         if self.mic:
             try:
-                import sounddevice as sd
                 import microfone as MIC
                 if self.sem_ruido and MIC.disponivel():
                     self._rn = MIC.RNNoise()
-                idx = MIC._indice(sd, self.mic_nome, True)
-                self._fluxo = sd.InputStream(device=idx, samplerate=TAXA, channels=1, dtype="float32",
-                                             blocksize=480, latency="low", callback=self._ao_capturar,
-                                             extra_settings=sd.WasapiSettings(auto_convert=True))
+                    self._aquecer = MIC.Aquecimento()       # sem a "tremida" do comeco
+                self._volume = MIC.AjusteVolume(self.ganho_db, self.volume_automatico)
+                # captura direto pela API de audio do Windows (DLL): aceita microfone plugado na hora
+                self._fluxo = MIC.CapturaMic(self.mic_nome, self._ao_capturar)
                 self._fluxo.start()
-                MIC.registrar(self._fluxo)      # protege de reinicios da PortAudio
             except Exception as e:
                 self.erro = f"microfone: {e}"
                 self._fluxo = None
@@ -339,6 +340,10 @@ class MisturadorAudio:
             limpo = [self._rn.processar(x[i:i + 480], self.intensidade)[0] for i in range(0, k, 480)]
             self._resto = x[k:].copy()
             x = np.concatenate(limpo) if limpo else np.zeros(0, np.float32)
+            if len(x):
+                x = self._aquecer.processar(x)
+        if len(x) and self._volume is not None:
+            x = self._volume.processar(x)          # volume do microfone + automatico + limitador
         if len(x):
             self._fila_mic.por(x)
 
@@ -379,8 +384,7 @@ class MisturadorAudio:
                 self._fluxo.close()
             except Exception:
                 pass
-            import microfone as MIC
-            MIC.liberar(self._fluxo)
+            pass
         if self.som_pc:
             dll().GrSomParar()
         if self._rn is not None:

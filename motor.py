@@ -183,6 +183,12 @@ def sanear(cfg):
         cfg["grav_janela"] = {k: v for k, v in j.items()
                               if (k in ("exe", "titulo") and isinstance(v, str) and len(v) < 300)
                               or (k == "hwnd" and isinstance(v, int))}
+    gm = cfg.get("ganhos_microfone")
+    cfg["ganhos_microfone"] = {k: float(min(24, max(-12, v))) for k, v in gm.items()
+                               if isinstance(k, str) and len(k) < 200 and isinstance(v, (int, float))
+                               and not isinstance(v, bool)} if isinstance(gm, dict) else {}
+    if not isinstance(cfg.get("volume_automatico"), bool):
+        cfg["volume_automatico"] = True
     for k in ("grav_mic_entrada", "microfone_entrada"):
         if not isinstance(cfg.get(k), str) or len(cfg[k]) > 200:
             cfg[k] = ""

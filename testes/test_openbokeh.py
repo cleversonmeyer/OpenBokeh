@@ -132,6 +132,60 @@ class Efeitos(unittest.TestCase):
         self.assertEqual(efeitos.Retoque()(img, alpha, 80).shape, img.shape)
 
 
+class Audio(unittest.TestCase):
+    def setUp(self):
+        import microfone
+        self.MIC = microfone
+
+    def _db(self, x):
+        return 20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-12)
+
+    def test_volume_automatico_sobe_microfone_baixo(self):
+        t = np.arange(48000 * 4) / 48000
+        voz = (0.004 * np.sin(2 * np.pi * 200 * t)).astype(np.float32)      # lapela baixo (~ -51 dBFS)
+        v = self.MIC.AjusteVolume(ganho_db=6, automatico=True)
+        y = np.concatenate([v.processar(voz[i:i + 480]) for i in range(0, len(voz), 480)])
+        self.assertGreater(self._db(y[-48000:]), -26)                       # chegou perto de -20 dBFS
+
+    def test_limitador_nao_deixa_estourar(self):
+        alto = (np.random.randn(48000) * 0.9).astype(np.float32)            # microfone alto demais
+        v = self.MIC.AjusteVolume(ganho_db=12, automatico=False)
+        y = np.concatenate([v.processar(alto[i:i + 480]) for i in range(0, len(alto), 480)])
+        self.assertLessEqual(float(np.abs(y).max()), 1.0)
+
+    def test_ganho_manual(self):
+        x = np.full(480, 0.01, np.float32)
+        v = self.MIC.AjusteVolume(ganho_db=20, automatico=False)
+        v.processar(x)
+        self.assertAlmostEqual(float(v.processar(x).mean()), 0.1, places=3)
+
+    def test_aquecimento_segura_o_comeco(self):
+        a = self.MIC.Aquecimento()
+        x = np.ones(480, np.float32)
+        blocos = [a.processar(x) for _ in range(60)]
+        self.assertEqual(float(blocos[0].max()), 0.0)                       # comeco em silencio
+        self.assertEqual(float(blocos[-1].min()), 1.0)                      # depois, normal
+
+    def test_ganho_salvo_por_microfone(self):
+        cfg = {"ganhos_microfone": {"Microfone (Realtek(R) Audio)": 12}}
+        self.assertEqual(self.MIC.ganho_de(cfg, "Microfone (Realtek(R) Audio)"), 12.0)
+        self.assertEqual(self.MIC.ganho_de(cfg, ""), 0.0)
+
+    def test_vigia_percebe_microfone_novo(self):
+        import threading
+        lista = [("Microfone A",)]
+        orig = self.MIC.assinatura_dispositivos
+        self.MIC.assinatura_dispositivos = lambda: lista[0]
+        try:
+            avisou = threading.Event()
+            vg = self.MIC.VigiaDispositivos(avisou.set)
+            lista[0] = ("Microfone A", "Microfone B")                       # "conectou" um microfone
+            self.assertTrue(avisou.wait(5))
+            vg.parar()
+        finally:
+            self.MIC.assinatura_dispositivos = orig
+
+
 class Mensagens(unittest.TestCase):
     def test_todos_os_avisos_montam(self):
         import mensagens

@@ -728,6 +728,22 @@ def rodar_janela(motor, cfg, na_bandeja=False):
                                 lambda cat="geral": abrir_config(cat), toast, PREV_W, PREV_H, LATERAL_W)
     # depois de gravar, mostra a pagina com o video novo na lista
     grav.ao_terminar.append(lambda _a: trocar_pagina(nome="gravar"))
+    # microfone conectado/desconectado com o app aberto: a lista se atualiza sozinha
+    import microfone as MIC_
+    pendente_mics = [False]
+
+    def mics_mudaram():
+        pendente_mics[0] = False
+        try:
+            # a lista vem direto do Windows (sempre atual): nao precisa religar nada
+            pg_grav.medidor_mic.parar()
+            pg_grav.microfones_mudaram()
+            print("Microfones: lista atualizada")
+            toast(_("Lista de microfones atualizada"))
+        except Exception as e:
+            print(f"[aviso] lista de microfones: {e}")
+    vigia_mics = MIC_.VigiaDispositivos(lambda: root.after(0, mics_mudaram))
+    grav.ao_terminar.append(lambda _a: pendente_mics[0] and root.after(500, mics_mudaram))
     root.bind("<<IrGravar>>", lambda _e: trocar_pagina(nome="gravar"))
     root.bind("<<IrCamera>>", lambda _e: trocar_pagina(nome="camera"))
     pintar_gravacao()
@@ -876,6 +892,7 @@ def rodar_janela(motor, cfg, na_bandeja=False):
             mudou()
 
     def sair():
+        vigia_mics.parar()
         grav.encerrar()
         for a in atalhos.values():
             a.parar()
